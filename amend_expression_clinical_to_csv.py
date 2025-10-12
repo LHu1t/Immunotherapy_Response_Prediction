@@ -13,7 +13,7 @@ for folder in rna_folders:
     subfolders = [f for f in os.listdir(folder) if os.path.isdir(os.path.join(folder, f))]
     print(subfolders[:10])  # show first 10 folder names
 
-target_genes = ["KRAS", "EGFR", "ALK", "BRAF", "ERBB2", "STK11"]
+target_genes = ["KRAS", "EGFR", "ALK", "BRAF", "ERBB2", "STK11", "TP53", "CDKN2A", "NFE2L2", "KEAP1", "PIK3CA", "SOX2"]  # Genes of interest
 expression_column = "fpkm_uq_unstranded"
 
 # === Step 2: Load clinical dataset ===
@@ -58,5 +58,5 @@ for sid in clinical_df["submitter_id"]:
 for gene in target_genes:
     clinical_df[f"{gene}_fpkm_uq"] = expression_data[gene]
 
-clinical_df.to_csv("combined_clinical_expression_ALL.csv", index=False)
-print("Combined clinical + expression data saved as 'combined_clinical_expression_ALL.csv'")
+clinical_df.to_csv("combined_clinical_expression_ALL2.csv", index=False)
+print("Combined clinical + expression data saved as 'combined_clinical_expression_ALL2.csv'")

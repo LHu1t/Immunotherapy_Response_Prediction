@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 import umap
 
 # === Step 1: Load data ===
-df = pd.read_csv("LUAD_LUSC_Data/combined_clinical_expression_ALL.csv")
+df = pd.read_csv("LUAD_LUSC_Data/combined_clinical_expression_ALL2.csv")
 
 # === Step 2: Detect the cancer subtype ===
 diagnosis_col = None
@@ -53,20 +53,48 @@ pca = PCA(n_components=2)
 pca_result = pca.fit_transform(X_scaled)
 df_filtered["PCA1"], df_filtered["PCA2"] = pca_result[:, 0], pca_result[:, 1]
 
+# Top genes driving PC1/PC2
+loadings = pd.DataFrame(
+    pca.components_.T,
+    index=expr_cols,
+    columns=["PC1", "PC2"]
+)
+top_pc1 = loadings["PC1"].abs().sort_values(ascending=False).head(10)
+top_pc2 = loadings["PC2"].abs().sort_values(ascending=False).head(10)
+
+print("\nTop 10 genes driving PC1:")
+print(top_pc1)
+print("\nTop 10 genes driving PC2:")
+print(top_pc2)
+
 # === Step 6: Linear Discriminant Analysis (supervised) ===
 lda = LDA(n_components=1)
 X_lda = lda.fit_transform(X_scaled, y)
 df_filtered["LDA1"] = X_lda[:, 0]
+
+lda_loadings = pd.Series(lda.coef_[0], index=expr_cols)
+top_lda = lda_loadings.abs().sort_values(ascending=False).head(10)
+print("\nTop 10 genes driving LDA separation:")
+print(top_lda)
 
 # === Step 7: t-SNE (nonlinear) ===
 tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
 X_tsne = tsne.fit_transform(X_scaled)
 df_filtered["tSNE1"], df_filtered["tSNE2"] = X_tsne[:, 0], X_tsne[:, 1]
 
+# Top correlated genes with tSNE1
+tsne_corr = X.corrwith(df_filtered["tSNE1"]).abs().sort_values(ascending=False).head(10)
+print("\nTop 10 genes correlated with tSNE1:")
+print(tsne_corr)
+
 # === Step 8: UMAP (nonlinear, often clearer than t-SNE) ===
 reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
 X_umap = reducer.fit_transform(X_scaled)
 df_filtered["UMAP1"], df_filtered["UMAP2"] = X_umap[:, 0], X_umap[:, 1]
+
+umap_corr = X.corrwith(df_filtered["UMAP1"]).abs().sort_values(ascending=False).head(10)
+print("\nTop 10 genes correlated with UMAP1:")
+print(umap_corr)
 
 # === Step 9: Visualization ===
 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -95,3 +123,6 @@ for ax, (xcol, ycol, title) in zip(axes.flatten(), plots):
 
 plt.tight_layout()
 plt.show()
+
+# Show number of patients (non-missing rows) used in the analysis
+print(f"\nNumber of patients included in analysis: {len(df_filtered)}")
