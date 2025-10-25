@@ -82,10 +82,12 @@ squamous_df = clinical_df[
 ].copy()
 
 # Save each subset to separate CSV files
-adenocarcinoma_df.to_csv("nsclc_clinical_data_LUAD.csv", index=False)
-squamous_df.to_csv("nsclc_clinical_data_LUSC.csv", index=False)
+clinical_df.to_csv("nsclc_clinical_data_ALL.csv", index=False)
+
+#adenocarcinoma_df.to_csv("nsclc_clinical_data_LUAD.csv", index=False)
+#squamous_df.to_csv("nsclc_clinical_data_LUSC.csv", index=False)
 
 # === Print summary ===
-print("✅ Split complete.")
+print("Filter complete.")
 print(f"Adenocarcinoma patients: {len(adenocarcinoma_df)}")
 print(f"Squamous cell carcinoma patients: {len(squamous_df)}")

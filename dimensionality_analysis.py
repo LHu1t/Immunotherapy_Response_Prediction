@@ -8,7 +8,7 @@ from sklearn.manifold import TSNE
 import umap
 
 # === Step 1: Load data ===
-df = pd.read_csv("LUAD_LUSC_Data/combined_clinical_expression_ALL2.csv")
+df = pd.read_csv("LUAD_LUSC_Data/Immunotherapy_Prediction/combined_clinical_expression_ALL2.csv")
 
 # === Step 2: Detect the cancer subtype ===
 diagnosis_col = None
