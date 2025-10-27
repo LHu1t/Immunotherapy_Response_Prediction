@@ -18,7 +18,13 @@ img_size = 224
 batch_size = 8
 num_epochs = 15
 lr = 1e-4
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("✅ Using Apple Metal (MPS) GPU")
+else:
+    device = torch.device("cpu")
+    print("⚠️ Using CPU (MPS not available)")
 
 # === STEP 1: Load gene expression data ===
 df_expr = pd.read_csv(gene_csv)
@@ -138,10 +144,10 @@ model = resnet.to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=lr)
 
-# === STEP 6: Training loop ===
+# === STEP 6: Training loop with per-gene validation loss ===
 for epoch in range(num_epochs):
     model.train()
-    train_loss = 0
+    train_loss = 0.0
     for imgs, targets in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
         imgs, targets = imgs.to(device), targets.to(device)
         optimizer.zero_grad()
@@ -152,19 +158,38 @@ for epoch in range(num_epochs):
         train_loss += loss.item() * imgs.size(0)
     train_loss /= len(train_loader.dataset)
 
-    # Validation
+    # === Validation ===
     model.eval()
-    val_loss = 0
+    val_loss = 0.0
+    per_gene_sum = torch.zeros(len(gene_cols), device=device)
+    per_gene_count = 0
+
     with torch.no_grad():
         for imgs, targets in val_loader:
             imgs, targets = imgs.to(device), targets.to(device)
             outputs = model(imgs)
             loss = criterion(outputs, targets)
             val_loss += loss.item() * imgs.size(0)
+
+            # Per-gene squared error
+            gene_sq_error = (outputs - targets) ** 2
+            per_gene_sum += gene_sq_error.sum(dim=0)
+            per_gene_count += imgs.size(0)
+
     val_loss /= len(val_loader.dataset)
+    per_gene_mse = (per_gene_sum / per_gene_count).cpu().numpy()
 
     print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
+    # --- Print per-gene losses ---
+    gene_loss_df = pd.DataFrame({
+        "gene": gene_cols,
+        "val_mse": per_gene_mse
+    }).sort_values("val_mse")
+    print("\nPer-Gene Validation Loss (sorted by MSE):")
+    print(gene_loss_df.to_string(index=False))
+    print("-" * 60)
+
 # === STEP 7: Save model ===
-torch.save(model.state_dict(), "resnet_gene_expression.pt")
+torch.save(model.state_dict(), "resnet_gene_expression_PerGeneTest.pt")
 print("✅ Model saved as resnet_gene_expression.pt")
