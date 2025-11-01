@@ -19,10 +19,21 @@ gene_csv = "LUAD_LUSC_Data/Immunotherapy_Prediction/combined_clinical_expression
 img_size = 224
 batch_size = 8
 num_epochs = 50
-lr = 1e-4
+
+# NOTE: lower LR when fine-tuning whole backbone; feel free to try 1e-5 -> 1e-4
+lr = 1e-5
+
+# increase tiles_per_slide for better variance (try 10-15 if you have time)
 tiles_per_slide = 5
 tile_size = 512
 val_ratio = 0.2
+
+# loss weights (tune if unstable)
+var_loss_w = 0.05     # penalty to match target variance
+pearson_w = 0.10      # small Pearson loss to encourage correlation
+
+# early stopping by mean Pearson
+early_stop_patience = 8
 
 # === DEVICE ===
 if torch.backends.mps.is_available():
@@ -50,10 +61,15 @@ gene_cols = [c for c in df_expr.columns if c.endswith("_fpkm_uq")]
 if not gene_cols:
     raise ValueError("No gene expression columns ending with '_fpkm_uq' found")
 
+# Normalize targets (z-score) - ensures training happens in stable numeric range
 df_expr[gene_cols] = df_expr[gene_cols].apply(pd.to_numeric, errors='coerce')
 df_expr = df_expr.dropna(subset=gene_cols, how='any')
+
+# log + z-score
 df_expr[gene_cols] = np.log1p(df_expr[gene_cols])
-df_expr[gene_cols] = (df_expr[gene_cols] - df_expr[gene_cols].mean()) / df_expr[gene_cols].std()
+y_means = df_expr[gene_cols].mean()
+y_stds = df_expr[gene_cols].std()
+df_expr[gene_cols] = (df_expr[gene_cols] - y_means) / y_stds
 
 print(f"✅ Cleaned expression data, {len(gene_cols)} genes")
 
@@ -96,14 +112,16 @@ class WSIExpressionDataset(Dataset):
 
     def _is_blank(self, img):
         """Heuristic: reject tiles with low saturation / tissue content."""
-        hsv = img.convert("HSV")
-        h, s, v = np.array(hsv).transpose(2, 0, 1)
-        return (s.mean() < 15) or (v.mean() > 230)
+        hsv = np.array(img.convert("HSV"))
+        s = hsv[...,1]
+        v = hsv[...,2]
+        tissue_pixels = ((s > 20) & (v < 240)).sum()
+        return tissue_pixels < (0.10 * s.size)
 
     def _load_random_tile(self, path):
         slide = openslide.OpenSlide(path)
         w, h = slide.level_dimensions[0]
-        for _ in range(10):  # up to 10 tries to find a non-blank tile
+        for _ in range(30):  # more tries to find a non-blank tile
             x, y = self._random_tile_coords(w, h)
             tile = slide.read_region((x, y), 0, (self.tile_size, self.tile_size)).convert("RGB")
             if not self._is_blank(tile):
@@ -144,19 +162,46 @@ val_loader = DataLoader(val_set, batch_size=1, shuffle=False)  # batch=1 per sli
 
 # === STEP 5: Model (ResNet50 full fine-tuning) ===
 resnet = models.resnet50(pretrained=True)
-# Unfreeze all layers for full fine-tuning
-for param in resnet.parameters():
-    param.requires_grad = True
 resnet.fc = nn.Linear(resnet.fc.in_features, len(gene_cols))
 model = resnet.to(device)
 
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=lr)
-# scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-# OR:
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+# Freeze batchnorm layers (stable training on small batch sizes)
+for m in model.modules():
+    if isinstance(m, nn.BatchNorm2d):
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad = False
 
-# === STEP 6: Training loop ===
+# Optionally you can partially unfreeze layers (comment/uncomment as needed)
+# for name, param in model.named_parameters():
+#     if "layer4" in name or "fc" in name:
+#         param.requires_grad = True
+#     else:
+#         param.requires_grad = False
+
+# === Loss / optimizer / scheduler ===
+criterion = nn.MSELoss(reduction='mean')
+optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-5)
+
+# Choice of scheduler: Warm restarts (good for fine-tuning) OR ReduceLROnPlateau
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-7)
+# scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+
+# pearson loss (differentiable proxy)
+def pearson_loss(preds, targets, eps=1e-8):
+    # preds, targets: [B, G]
+    preds_c = preds - preds.mean(dim=0, keepdim=True)
+    targ_c = targets - targets.mean(dim=0, keepdim=True)
+    num = (preds_c * targ_c).sum(dim=0)
+    den = torch.sqrt((preds_c**2).sum(dim=0) * (targ_c**2).sum(dim=0) + eps)
+    r = num / den
+    # return 1 - mean(r)  (we minimize this)
+    return (1.0 - r).mean()
+
+# === STEP 6: Training loop with variance regulariser, pearson loss, early stopping ===
+best_mean_pearson = -999.0
+patience_counter = 0
+
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0.0
@@ -168,8 +213,21 @@ for epoch in range(num_epochs):
         for t in range(imgs_batch.size(1)):
             preds = model(imgs_batch[:, t, :, :, :])
             preds_list.append(preds)
-        preds_mean = torch.stack(preds_list, dim=0).mean(dim=0)
-        loss = criterion(preds_mean, targets)
+        preds_mean = torch.stack(preds_list, dim=0).mean(dim=0)  # [B, G]
+
+        # MSE
+        mse_loss = criterion(preds_mean, targets)
+
+        # variance matching loss (encourage output variance similar to target)
+        pred_var = preds_mean.var(dim=0, unbiased=False).mean()
+        targ_var = targets.var(dim=0, unbiased=False).mean()
+        var_loss = (pred_var - targ_var).abs()
+
+        # pearson loss
+        p_loss = pearson_loss(preds_mean, targets)
+
+        loss = mse_loss + var_loss_w * var_loss + pearson_w * p_loss
+
         loss.backward()
         optimizer.step()
         train_loss += loss.item() * imgs_batch.size(0)
@@ -190,22 +248,30 @@ for epoch in range(num_epochs):
                 preds = model(imgs_batch[:, t, :, :, :])
                 preds_list.append(preds)
             preds_mean = torch.stack(preds_list, dim=0).mean(dim=0)
-            loss = criterion(preds_mean, targets)
-            val_loss += loss.item()
+            mse = criterion(preds_mean, targets)
+            val_loss += mse.item()
             per_gene_sq_sum += ((preds_mean - targets) ** 2).sum(dim=0)
             per_gene_count += 1
             preds_all.append(preds_mean.cpu().numpy())
             targets_all.append(targets.cpu().numpy())
 
     val_loss /= len(val_loader)
-    scheduler.step(val_loss)
+
+    # scheduler step (choose appropriate call depending on scheduler)
+    # CosineAnnealingWarmRestarts uses scheduler.step(epoch + epoch_frac) or scheduler.step()
+    # We call scheduler.step() each epoch to update restarts.
+    try:
+        scheduler.step()
+    except Exception:
+        # If using ReduceLROnPlateau uncomment this and call with val_loss:
+        # scheduler.step(val_loss)
+        pass
+
     preds_all = np.vstack(preds_all)
     targets_all = np.vstack(targets_all)
 
+    # quick diagnostics:
     print(preds_all.shape, targets_all.shape)
-    print(preds_all[:5, :5])
-    print(targets_all[:5, :5])
-    print("First 10 genes:", gene_cols[:10])
     print("Preds mean/std:", preds_all.mean(), preds_all.std())
     print("Targets mean/std:", targets_all.mean(), targets_all.std())
 
@@ -213,14 +279,30 @@ for epoch in range(num_epochs):
     per_gene_mse = (per_gene_sq_sum / per_gene_count).cpu().numpy()
     pearsons = []
     for i in range(len(gene_cols)):
-        r, _ = pearsonr(preds_all[:, i], targets_all[:, i])
+        try:
+            r, _ = pearsonr(preds_all[:, i], targets_all[:, i])
+        except Exception:
+            r = np.nan
         pearsons.append(r)
 
     results_df = pd.DataFrame({"gene": gene_cols, "val_mse": per_gene_mse, "pearson_r": pearsons}).sort_values("val_mse")
 
-    print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+    mean_pearson = np.nanmean(pearsons)
+    print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Mean Pearson: {mean_pearson:.4f}")
     print(results_df.to_string(index=False))
     print("-" * 60)
 
-torch.save(model.state_dict(), "resnet50_gene_expression_multitile.pt")
-print("✅ Model saved as resnet50_gene_expression_multitile.pt")
+    # Early stopping & save best by mean Pearson
+    if mean_pearson > best_mean_pearson:
+        best_mean_pearson = mean_pearson
+        torch.save(model.state_dict(), "best_resnet50_by_mean_pearson.pt")
+        print(f"✅ Saved new best model (mean Pearson {best_mean_pearson:.4f})")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= early_stop_patience:
+            print("⏱ Early stopping triggered.")
+            break
+
+torch.save(model.state_dict(), "resnet50_gene_expression_multitile_final.pt")
+print("✅ Final model saved as resnet50_gene_expression_multitile_final.pt")
