@@ -12,28 +12,25 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import models, transforms
 import openslide
 from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
 
 # === CONFIG ===
 svs_root = r"/Volumes/SeagateBas/Immunotherapy/LUAD"
 gene_csv = "LUAD_LUSC_Data/Immunotherapy_Prediction/combined_clinical_expression_ALL2.csv"
 img_size = 224
 batch_size = 8
-num_epochs = 50
+num_epochs = 200
 
 # NOTE: lower LR when fine-tuning whole backbone; feel free to try 1e-5 -> 1e-4
 lr = 1e-5
 
 # increase tiles_per_slide for better variance (try 10-15 if you have time)
-tiles_per_slide = 5
+tiles_per_slide = 10
 tile_size = 512
 val_ratio = 0.2
 
-# loss weights (tune if unstable)
-var_loss_w = 0.05     # penalty to match target variance
-pearson_w = 0.10      # small Pearson loss to encourage correlation
-
 # early stopping by mean Pearson
-early_stop_patience = 8
+early_stop_patience = 40
 
 # === DEVICE ===
 if torch.backends.mps.is_available():
@@ -71,7 +68,23 @@ y_means = df_expr[gene_cols].mean()
 y_stds = df_expr[gene_cols].std()
 df_expr[gene_cols] = (df_expr[gene_cols] - y_means) / y_stds
 
-print(f"✅ Cleaned expression data, {len(gene_cols)} genes")
+print(f"Extracted, Z scored, and logged expression data, {len(gene_cols)} genes")
+
+# === Add clinical covariates ===
+# Ensure age and gender exist
+if 'age_years' not in df_expr.columns or 'demographic.gender' not in df_expr.columns:
+    raise ValueError("Expected 'age_years' and 'demographic.gender' in clinical CSV")
+
+# Normalize and encode
+df_expr['age_years'] = pd.to_numeric(df_expr['age_years'], errors='coerce').fillna(df_expr['age_years'].median())
+df_expr['age_years_z'] = (df_expr['age_years'] - df_expr['age_years'].mean()) / df_expr['age_years'].std()
+
+# Encode gender as numeric: male=0, female=1 (or vice versa)
+df_expr['gender_encoded'] = df_expr['demographic.gender'].str.lower().map({'male': 0, 'female': 1}).fillna(0)
+
+# List of covariate columns
+clinical_cols = ['age_years_z', 'gender_encoded']
+
 
 # === STEP 2: Find SVS files and match ===
 def extract_tcga_id(filename):
@@ -94,13 +107,18 @@ if len(df_matched) == 0:
     raise SystemExit("No matching cases found between CSV and SVS files")
 
 # === STEP 3: Dataset with multi-tile sampling ===
+# === STEP 3: Dataset with caching ===
 class WSIExpressionDataset(Dataset):
-    def __init__(self, df, genes, transform=None, tile_size=512, tiles_per_slide=5):
+    def __init__(self, df, genes, transform=None, tile_size=512, tiles_per_slide=10, cache=True, max_cache_tiles=15):
         self.df = df.reset_index(drop=True)
         self.genes = genes
+        self.clinical_cols = clinical_cols or []
         self.transform = transform
         self.tile_size = tile_size
         self.tiles_per_slide = tiles_per_slide
+        self.cache = cache
+        self.max_cache_tiles = max_cache_tiles
+        self.tile_cache = {}  # {svs_path: [PIL.Image, ...]}
 
     def __len__(self):
         return len(self.df)
@@ -113,34 +131,53 @@ class WSIExpressionDataset(Dataset):
     def _is_blank(self, img):
         """Heuristic: reject tiles with low saturation / tissue content."""
         hsv = np.array(img.convert("HSV"))
-        s = hsv[...,1]
-        v = hsv[...,2]
+        s = hsv[..., 1]
+        v = hsv[..., 2]
         tissue_pixels = ((s > 20) & (v < 240)).sum()
         return tissue_pixels < (0.10 * s.size)
 
-    def _load_random_tile(self, path):
-        slide = openslide.OpenSlide(path)
+    def _load_random_tile(self, slide):
         w, h = slide.level_dimensions[0]
-        for _ in range(30):  # more tries to find a non-blank tile
+        for _ in range(30):
             x, y = self._random_tile_coords(w, h)
             tile = slide.read_region((x, y), 0, (self.tile_size, self.tile_size)).convert("RGB")
             if not self._is_blank(tile):
-                slide.close()
                 return tile
-        slide.close()
         return Image.new("RGB", (self.tile_size, self.tile_size), (255, 255, 255))
+
+    def _load_or_cache_tiles(self, svs_path):
+        if self.cache and svs_path in self.tile_cache:
+            # Reuse cached tiles
+            return self.tile_cache[svs_path]
+
+        slide = openslide.OpenSlide(svs_path)
+        tiles = []
+        for _ in range(self.max_cache_tiles):
+            tile = self._load_random_tile(slide)
+            tiles.append(tile)
+        slide.close()
+
+        if self.cache:
+            self.tile_cache[svs_path] = tiles
+        return tiles
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        svs_path = row["svs_path"]
+        tiles = self._load_or_cache_tiles(svs_path)
+
+        # Randomly sample subset for this epoch
+        sampled_tiles = random.sample(tiles, k=min(self.tiles_per_slide, len(tiles)))
+
         img_list = []
-        for _ in range(self.tiles_per_slide):
-            tile = self._load_random_tile(row["svs_path"])
+        for tile in sampled_tiles:
             if self.transform:
                 tile = self.transform(tile)
             img_list.append(tile)
-        imgs = torch.stack(img_list)  # shape: [tiles_per_slide, 3, H, W]
+        imgs = torch.stack(img_list)
         expr = torch.tensor(row[self.genes].values.astype(np.float32))
-        return imgs, expr
+        clinical = torch.tensor(row[self.clinical_cols].values.astype(np.float32)) if self.clinical_cols else torch.zeros(0)
+        return imgs, expr, clinical
 
 # === STEP 4: Transforms ===
 transform = transforms.Compose([
@@ -160,10 +197,31 @@ print(f"Training: {train_size}, Validation: {val_size}")
 train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=1, shuffle=False)  # batch=1 per slide (multi-tile inside)
 
-# === STEP 5: Model (ResNet50 full fine-tuning) ===
+# === STEP 5: Model (ResNet50 + clinical features) ===
 resnet = models.resnet50(pretrained=True)
-resnet.fc = nn.Linear(resnet.fc.in_features, len(gene_cols))
-model = resnet.to(device)
+in_features = resnet.fc.in_features
+resnet.fc = nn.Identity()  # removes final FC; now resnet outputs the embedding vector
+
+class ImageClinicalModel(nn.Module):
+    def __init__(self, base_model, n_genes, n_clinical):
+        super().__init__()
+        self.base = base_model
+        self.fc = nn.Sequential(
+            nn.Linear(in_features + n_clinical, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, n_genes)
+        )
+
+    def forward(self, imgs, clinical):
+        feats = self.base(imgs)  # [B, in_features]
+        if clinical.nelement() > 0:  # safety check for empty covariate vector
+            feats = torch.cat([feats, clinical], dim=1)
+        out = self.fc(feats)
+        return out
+
+model = ImageClinicalModel(resnet, len(gene_cols), len(clinical_cols)).to(device)
+
 
 # Freeze batchnorm layers (stable training on small batch sizes)
 for m in model.modules():
@@ -180,12 +238,12 @@ for m in model.modules():
 #         param.requires_grad = False
 
 # === Loss / optimizer / scheduler ===
-criterion = nn.MSELoss(reduction='mean')
+criterion = nn.SmoothL1Loss(beta=0.1, reduction='mean')  # more stable than MSE
 optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-5)
 
-# Choice of scheduler: Warm restarts (good for fine-tuning) OR ReduceLROnPlateau
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-7)
-# scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+# adaptive scheduler: reduce LR when val loss plateaus
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=4, verbose=True)
+
 
 # pearson loss (differentiable proxy)
 def pearson_loss(preds, targets, eps=1e-8):
@@ -205,13 +263,13 @@ patience_counter = 0
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0.0
-    for imgs_batch, targets in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+    for imgs_batch, targets, clinical_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
         optimizer.zero_grad()
-        imgs_batch, targets = imgs_batch.to(device), targets.to(device)
+        imgs_batch, targets, clinical_batch = imgs_batch.to(device), targets.to(device), clinical_batch.to(device)
         # imgs_batch: [B, tiles_per_slide, 3, H, W]
         preds_list = []
         for t in range(imgs_batch.size(1)):
-            preds = model(imgs_batch[:, t, :, :, :])
+            preds = model(imgs_batch[:, t, :, :, :], clinical_batch)
             preds_list.append(preds)
         preds_mean = torch.stack(preds_list, dim=0).mean(dim=0)  # [B, G]
 
@@ -226,7 +284,17 @@ for epoch in range(num_epochs):
         # pearson loss
         p_loss = pearson_loss(preds_mean, targets)
 
-        loss = mse_loss + var_loss_w * var_loss + pearson_w * p_loss
+        # loss weights (tune if unstable)
+        if epoch < 25:
+            mse_w = 0.1
+            var_w = 0.02
+            pearson_w = 0.25
+        else:
+            mse_w = 0.01
+            var_w = 0.01
+            pearson_w = 1.0
+
+        loss = mse_w * mse_loss + var_w * var_loss + pearson_w * p_loss
 
         loss.backward()
         optimizer.step()
@@ -241,11 +309,11 @@ for epoch in range(num_epochs):
     preds_all, targets_all = [], []
 
     with torch.no_grad():
-        for imgs_batch, targets in val_loader:
-            imgs_batch, targets = imgs_batch.to(device), targets.to(device)
+        for imgs_batch, targets, clinical_batch in val_loader:
+            imgs_batch, targets, clinical_batch = imgs_batch.to(device), targets.to(device), clinical_batch.to(device)
             preds_list = []
             for t in range(imgs_batch.size(1)):
-                preds = model(imgs_batch[:, t, :, :, :])
+                preds = model(imgs_batch[:, t, :, :, :], clinical_batch)
                 preds_list.append(preds)
             preds_mean = torch.stack(preds_list, dim=0).mean(dim=0)
             mse = criterion(preds_mean, targets)
@@ -260,12 +328,7 @@ for epoch in range(num_epochs):
     # scheduler step (choose appropriate call depending on scheduler)
     # CosineAnnealingWarmRestarts uses scheduler.step(epoch + epoch_frac) or scheduler.step()
     # We call scheduler.step() each epoch to update restarts.
-    try:
-        scheduler.step()
-    except Exception:
-        # If using ReduceLROnPlateau uncomment this and call with val_loss:
-        # scheduler.step(val_loss)
-        pass
+    scheduler.step(val_loss)
 
     preds_all = np.vstack(preds_all)
     targets_all = np.vstack(targets_all)
@@ -291,6 +354,37 @@ for epoch in range(num_epochs):
     print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Mean Pearson: {mean_pearson:.4f}")
     print(results_df.to_string(index=False))
     print("-" * 60)
+
+    # === Visualization: predicted vs ground truth for genes ===
+
+    genes_to_plot = ["STK11_fpkm_uq", "NFE2L2_fpkm_uq", "BRAF_fpkm_uq"]  # choose any subset of gene_cols
+x
+    os.makedirs("plots", exist_ok=True)
+    n_patients = min(20, len(preds_all))
+    idxs = np.random.choice(len(preds_all), n_patients, replace=False)
+    x = np.arange(n_patients)
+
+    for target_gene in genes_to_plot:
+        if target_gene not in gene_cols:
+            print(f"⚠️ Gene {target_gene} not found in gene_cols; skipping.")
+            continue
+
+        gene_idx = gene_cols.index(target_gene)
+        preds_gene = preds_all[idxs, gene_idx]
+        targets_gene = targets_all[idxs, gene_idx]
+        gene_mean = targets_all[:, gene_idx].mean()  # population mean (≈0 for z-scored data)
+
+        plt.figure(figsize=(10, 5))
+        plt.bar(x - 0.2, targets_gene, width=0.4, label="Ground Truth", color="skyblue")
+        plt.bar(x + 0.2, preds_gene, width=0.4, label="Predicted", color="orange")
+        plt.axhline(y=gene_mean, color="red", linestyle="--", linewidth=1.5, label=f"Population Mean ({gene_mean:.2f})")
+        plt.xticks(x, [f"P{i}" for i in range(n_patients)], rotation=45)
+        plt.ylabel("Z-score FPKM-UQ")
+        plt.title(f"{target_gene}: Prediction vs Ground Truth (Epoch {epoch+1})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"plots/{target_gene}_epoch{epoch+1}.png", dpi=150)
+        plt.close()
 
     # Early stopping & save best by mean Pearson
     if mean_pearson > best_mean_pearson:
