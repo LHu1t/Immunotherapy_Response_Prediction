@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Rescale-before-tiling pipeline using pyvips.
 
-Requirements:
-  conda install -c conda-forge pyvips openslide-python pillow numpy scikit-image tqdm
-  (optional) pip install staintools
-
-Edit CONFIG section below before running.
-"""
 import math
 import os
 import random
@@ -15,99 +7,101 @@ import csv
 import traceback
 from pathlib import Path
 from multiprocessing import Pool
+import argparse
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-# imports that may be missing on some systems
-try:
-    import pyvips
-except Exception:
-    pyvips = None
-
 try:
     import openslide
-except Exception:
+except:
     openslide = None
 
 from skimage.filters import threshold_otsu
 from skimage.color import rgb2gray
 
-# Optional: staintools for Macenko/Vahadane
 try:
     import staintools
     STAINTOOLS_AVAILABLE = True
-except Exception:
+except:
     STAINTOOLS_AVAILABLE = False
 
 # -----------------------------
-# CONFIG - Edit these values
+# CONFIG (unchanged)
 # -----------------------------
-INPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy"          # top-level root with cancer folder
-CANCER = "LUAD_TEST"                       # folder under INPUT_ROOT
-OUTPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Tiles_test"  # where tiles + manifest are written
+INPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy" # "/home/zcemlhu/Scratch"
+CANCER = "LUAD" # "LUSC"
+OUTPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Test_Tiles2" # "/home/zcemlhu/Scratch/LUSC_Tiles"
+
 TILE_SIZE = 512
-TILES_PER_WSI = 5000                # target number of tiles per WSI (pads with blanks)
-OCCUPANCY_THRESH = 0.1                # fraction of tile area considered tissue
-TARGET_MPP = 0.5                      # desired microns per pixel (0.5 = 20x)
+TILES_PER_WSI = 5000
+OCCUPANCY_THRESH = 0.1
+TARGET_MPP = 0.5
 WORKERS = 4
+
 NORMALIZE = True
-STAIN_REF_PATH = r"/Volumes/SeagateBas/Immunotherapy/LUAD_TEST/8f7cdbca-32a7-4bd3-be11-6cf7b7b03d13/TCGA-50-6591-01Z-00-DX1.12e1050b-75e9-4059-b945-291995b3e93c.svs" # optional reference tile for stain normalization
+STAIN_REF_PATH = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Test/8f7cdbca-32a7-4bd3-be11-6cf7b7b03d13/TCGA-50-6591-01Z-00-DX1.12e1050b-75e9-4059-b945-291995b3e93c.svs"# "/home/zcemlhu/Scratch/LUSC/0a780b0b-fce9-4999-92ba-a8b277578a1d/TCGA-60-2724-01Z-00-DX1.98f9e48f-9c09-4969-aa34-05666616ee9a.svs"
+
 MANIFEST_NAME = 'manifest.csv'
-THUMB_MAX_DIM = 1024                  # thumbnail size for Otsu mask
-SAVE_FORMAT = 'png'                   # 'png' or 'webp' (png is most portable)
-PNG_COMPRESSION = 6                   # Pillow compress level, 0-9 (only for PNG)
-WEBP_QUALITY = 80                     # if SAVE_FORMAT == 'webp'
+THUMB_MAX_DIM = 512
+SAVE_FORMAT = 'png'
+PNG_COMPRESSION = 6
+WEBP_QUALITY = 80
 # -----------------------------
+
+
 
 def get_mpp(slide):
-    """Return microns-per-pixel if available, else None"""
-    if slide is None:
-        return None
-    props = slide.properties
-    keys = ['openslide.mpp-x', 'openslide.mpp-y', 'aperio.MPP', 'svs.mpp']
+    keys = ['openslide.mpp-x', 'aperio.MPP', 'openslide.mpp-y']
     for k in keys:
-        if k in props:
+        if k in slide.properties:
             try:
-                return float(props[k])
-            except Exception:
-                continue
+                return float(slide.properties[k])
+            except:
+                pass
     return None
 
-def make_thumbnail_array(vips_img, max_dim=1024):
-    """Create a thumbnail (vips) and return an RGB numpy array."""
-    # pyvips: thumbnail_image returns a small image; ensure within max_dim
-    thumb = vips_img.thumbnail_image(max_dim)
-    h = thumb.height
-    w = thumb.width
-    bands = thumb.bands  # likely 3
-    mem = thumb.write_to_memory()
-    arr = np.frombuffer(mem, dtype=np.uint8)
-    arr = arr.reshape((h, w, bands))
-    # if alpha channel present, drop it
-    if arr.shape[2] > 3:
-        arr = arr[:, :, :3]
-    return arr
-
-def otsu_mask_from_rgb_arr(arr):
-    gray = rgb2gray(arr)
-    thresh = threshold_otsu((gray * 255).astype('uint8')) / 255.0
-    mask = gray < thresh
-    return mask
 
 def iter_svs_files(root_dir, cancer):
-    root = Path(root_dir)
-    base = root / cancer
-    if not base.exists():
-        return
-    for patient in base.iterdir():
+    root = Path(root_dir) / cancer
+    for patient in root.iterdir():
         if not patient.is_dir():
             continue
-        for svs in patient.glob('*.svs'):
+        for svs in patient.glob("*.svs"):
             yield svs
 
-def process_wsi_pyvips(args):
+
+def otsu_mask(arr, max_dim=THUMB_MAX_DIM):
+    """Compute fast Otsu mask on a downscaled thumbnail."""
+    h, w = arr.shape[:2]
+    scale = max_dim / max(h, w)
+
+    if scale < 1:
+        thumb = Image.fromarray(arr).resize(
+            (int(w * scale), int(h * scale)),
+            resample=Image.BILINEAR
+        )
+        small = np.array(thumb)
+    else:
+        small = arr
+
+    gray = rgb2gray(small)
+    thresh = threshold_otsu((gray * 255).astype(np.uint8)) / 255.0
+    mask_small = gray < thresh
+
+    # upscale mask back
+    mask = np.array(
+        Image.fromarray((mask_small * 255).astype(np.uint8)).resize(
+            (w, h),
+            resample=Image.NEAREST
+        )
+    ) > 0
+
+    return mask
+
+
+def process_wsi_no_pyvips(args):
     (
         wsi_path,
         output_root,
@@ -118,182 +112,177 @@ def process_wsi_pyvips(args):
         normalize,
         stain_ref
     ) = args
-    """
-    Rescale slide to target_mpp using pyvips then tile. Returns (wsi_path, success, payload)
-    """
+
     wsi_path = Path(wsi_path)
     wsi_id = wsi_path.stem
     out_dir = Path(output_root) / wsi_path.parent.name / wsi_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # open slide via openslide for metadata (MPP). Use pyvips for image ops.
-    slide = None
-    if openslide is not None:
-        try:
-            slide = openslide.OpenSlide(str(wsi_path))
-        except Exception:
-            slide = None
-
     try:
-        # determine slide mpp
-        slide_mpp = get_mpp(slide) if slide is not None else None
+        slide = openslide.OpenSlide(str(wsi_path))
+        slide_mpp = get_mpp(slide)
+
         if slide_mpp is None:
-            print(f"[WARN] {wsi_id}: slide MPP not found in metadata; will not rescale (extracted at native resolution).")
-            desired_scale = 1.0
+            print(f"[WARN] {wsi_id}: No MPP → no rescale.")
+            scale = 1.0
         else:
-            desired_scale = slide_mpp / target_mpp
-            # desired_scale may be <1 (we want to shrink); that's fine.
-            if desired_scale <= 0:
-                desired_scale = 1.0
+            scale = slide_mpp / target_mpp
 
-        if pyvips is None:
-            return (str(wsi_path), False, "pyvips not available; install pyvips (see instructions).")
-
-        # open whole-slide via pyvips (streaming). Let vips pick efficient loader.
-        vimg = pyvips.Image.new_from_file(str(wsi_path), access='sequential')
-
-        # compute target width/height (floating)
-        tgt_w = int(math.ceil(vimg.width * desired_scale))
-        tgt_h = int(math.ceil(vimg.height * desired_scale))
-
-        if desired_scale != 1.0:
-            # use shrink/resize for high-quality (vips.resize is fast and streaming)
-            # vips.resize takes scale factor = output/input
-            vimg_small = vimg.resize(desired_scale)
+        # choose appropriate level for reading whole slide
+        if scale >= 1:
+            # downscale → read using lower pyramid level
+            best = slide.get_best_level_for_downsample(scale)
+            down = slide.level_downsamples[best]
+            w, h = slide.level_dimensions[best]
+            region = slide.read_region((0, 0), best, (w, h)).convert("RGB")
+            img = np.array(region)
+            # scale to final
+            final_w = int(img.shape[1] * (down / scale))
+            final_h = int(img.shape[0] * (down / scale))
+            img_rescaled = np.array(
+                Image.fromarray(img).resize(
+                    (final_w, final_h),
+                    resample=Image.BILINEAR
+                )
+            )
         else:
-            vimg_small = vimg
+            # need to upscale → read level 0
+            w, h = slide.dimensions
+            region = slide.read_region((0, 0), 0, (w, h)).convert("RGB")
+            img = np.array(region)
+            final_w = int(w / scale)
+            final_h = int(h / scale)
+            img_rescaled = np.array(
+                Image.fromarray(img).resize(
+                    (final_w, final_h),
+                    resample=Image.BILINEAR
+                )
+            )
 
-        # now we are operating at the target MPP (or at native if MPP missing)
+        # build Otsu tissue mask
+        mask = otsu_mask(img_rescaled, max_dim=THUMB_MAX_DIM)
+        H, W = img_rescaled.shape[:2]
 
-        # create thumbnail from the rescaled image for mask
-        thumb_arr = make_thumbnail_array(vimg_small, max_dim=THUMB_MAX_DIM)
-        mask_thumb = otsu_mask_from_rgb_arr(thumb_arr)
-        thumb_h, thumb_w = mask_thumb.shape
-
-        # map from rescaled pixels to thumb coords
-        scale_x = vimg_small.width / float(thumb_w)
-        scale_y = vimg_small.height / float(thumb_h)
-
-        # build candidate tile list (non-overlapping grid)
-        tile_coords = []
-        for y in range(0, vimg_small.height, tile_size):
-            for x in range(0, vimg_small.width, tile_size):
-                # map tile region to thumbnail coords
-                tx0 = int(x / scale_x)
-                ty0 = int(y / scale_y)
-                tx1 = int(min((x + tile_size) / scale_x, thumb_w))
-                ty1 = int(min((y + tile_size) / scale_y, thumb_h))
-                if tx1 <= tx0 or ty1 <= ty0:
+        # tile coords
+        coords = []
+        for y in range(0, H, tile_size):
+            for x in range(0, W, tile_size):
+                sub = mask[y:y+tile_size, x:x+tile_size]
+                if sub.size == 0:
                     continue
-                sub = mask_thumb[ty0:ty1, tx0:tx1]
-                occupancy = float(sub.mean())
-                if occupancy >= occupancy_thresh:
-                    tile_coords.append((x, y))
+                if sub.mean() >= occupancy_thresh:
+                    coords.append((x, y))
 
-        n_candidates = len(tile_coords)
-        print(f"[INFO] {wsi_id}: found {n_candidates} non-overlapping tissue tiles at target MPP.")
+        print(f"[INFO] {wsi_id}: {len(coords)} tissue tiles found.")
 
-        # decide selected tiles and padding
-        if tiles_per_wsi is None:
-            selected = tile_coords
-            padded = 0
+        # sample/pad
+        if len(coords) >= tiles_per_wsi:
+            selected = random.sample(coords, tiles_per_wsi)
         else:
-            if n_candidates >= tiles_per_wsi:
-                selected = random.sample(tile_coords, tiles_per_wsi)
-                padded = 0
-                print(f"[INFO] {wsi_id}: using {tiles_per_wsi} tiles (no padding).")
-            else:
-                need = tiles_per_wsi - n_candidates
-                selected = tile_coords.copy()
-                selected.extend([None] * need)
-                padded = need
-                print(f"[INFO] {wsi_id}: padding with {need} blank tiles (total target {tiles_per_wsi}).")
+            need = tiles_per_wsi - len(coords)
+            selected = coords + [None] * need
+            print(f"[INFO] {wsi_id}: padded {need} tiles.")
 
-        # prepare normalizer if requested
+        # stain normaliser
         normalizer = None
-        if normalize and STAINTOOLS_AVAILABLE:
+        if normalize and STAINTOOLS_AVAILABLE and stain_ref is not None:
             try:
-                normalizer = staintools.StainNormalizer(method='vahadane')
-                if stain_ref is not None:
-                    normalizer.fit(stain_ref)
-            except Exception:
+                normalizer = staintools.StainNormalizer(method="vahadane")
+                normalizer.fit(stain_ref)
+            except:
                 normalizer = None
 
-        saved_rows = []
-        # iterate and save tiles; crop returns a vips image; write via pillow for portability
+        rows = []
+
+        # save tiles
         for i, coord in enumerate(selected):
             if coord is None:
-                # blank white tile
-                im = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
+                tile = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
             else:
                 x, y = coord
-                # ensure cropping inside bounds: width,height may be smaller at edges
-                w_crop = min(tile_size, vimg_small.width - x)
-                h_crop = min(tile_size, vimg_small.height - y)
-                tile_v = vimg_small.crop(x, y, w_crop, h_crop)
-                # if edge tile smaller, expand/pad to tile_size with white
-                mem = tile_v.write_to_memory()
-                arr = np.frombuffer(mem, dtype=np.uint8)
-                arr = arr.reshape((h_crop, w_crop, tile_v.bands))
-                if arr.shape[2] > 3:
-                    arr = arr[:, :, :3]
-                im = Image.fromarray(arr)
-                if im.size != (tile_size, tile_size):
-                    # pad on right/bottom with white to reach tile_size
-                    new = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
-                    new.paste(im, (0, 0))
-                    im = new
+                tile_arr = img_rescaled[y:y+tile_size, x:x+tile_size]
+                tile = Image.fromarray(tile_arr)
+                if tile.size != (tile_size, tile_size):
+                    pad = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
+                    pad.paste(tile, (0, 0))
+                    tile = pad
 
-            # optional normalization (PIL->ndarray->staintools->PIL)
-            if normalize and STAINTOOLS_AVAILABLE and normalizer is not None:
+            # stain normalisation
+            if normalize and normalizer is not None:
                 try:
-                    arr = np.array(im)
-                    arr = normalizer.transform(arr)
-                    im = Image.fromarray(arr)
-                except Exception:
+                    arr = normalizer.transform(np.array(tile))
+                    tile = Image.fromarray(arr)
+                except:
                     pass
 
-            # save tile
             fname = out_dir / f"{wsi_id}_tile_{i:05d}.{SAVE_FORMAT}"
-            if SAVE_FORMAT == 'png':
-                im.save(fname, compress_level=PNG_COMPRESSION)
+
+            if SAVE_FORMAT == "png":
+                tile.save(fname, compress_level=PNG_COMPRESSION)
             else:
-                # webp
-                im.save(fname, quality=WEBP_QUALITY, format='WEBP')
+                tile.save(fname, quality=WEBP_QUALITY, format="WEBP")
 
-            saved_rows.append((str(wsi_path), str(fname), i))
+            rows.append((str(wsi_path), str(fname), i))
 
-        return (str(wsi_path), True, saved_rows)
+        return (str(wsi_path), True, rows)
 
     except Exception as e:
-        tb = traceback.format_exc()
-        return (str(wsi_path), False, f"Processing error: {e}\\n{tb}")
+        return (str(wsi_path), False, traceback.format_exc())
+    
+def chunk_list(lst, chunk_size):
+    """Yield successive chunk_size-sized chunks."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
 
 def main():
-    svs_files = list(iter_svs_files(INPUT_ROOT, CANCER))
-    print(f"Found {len(svs_files)} SVS files under {INPUT_ROOT}/{CANCER}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-index", type=int, default=0, help="Which batch to process (0-based index)")
+    parser.add_argument("--batch-size", type=int, default=50, help="Slides per batch")
+    args = parser.parse_args()
 
+    # 1. Get all slides
+    svs_files = list(iter_svs_files(INPUT_ROOT, CANCER))
+    print(f"Found {len(svs_files)} SVS files.")
+
+    # 2. Split into batches
+    batches = list(chunk_list(svs_files, args.batch_size))
+
+    if args.batch_index >= len(batches):
+        print(f"Batch index {args.batch_index} is out of range "
+              f"(total batches = {len(batches)})")
+        return
+
+    batch = batches[args.batch_index]
+    print(f"Processing batch {args.batch_index} of {len(batches)-1}, "
+          f"{len(batch)} slides")
+
+    # 3. Prepare stain reference
     stain_ref = None
     if NORMALIZE and STAINTOOLS_AVAILABLE and STAIN_REF_PATH is not None:
         try:
-            stain_ref = np.array(Image.open(STAIN_REF_PATH).convert('RGB'))
-        except Exception:
+            stain_ref = np.array(
+                Image.open(STAIN_REF_PATH).convert("RGB")
+            )
+        except:
             stain_ref = None
 
+    # 4. Prepare tasks only for THIS batch
     tasks = []
-    for svs in svs_files:
-        tasks.append((str(svs), OUTPUT_ROOT, TILES_PER_WSI, TILE_SIZE, OCCUPANCY_THRESH,
-                      TARGET_MPP, NORMALIZE, stain_ref))
+    for svs in batch:
+        tasks.append((str(svs), OUTPUT_ROOT, TILES_PER_WSI, TILE_SIZE, OCCUPANCY_THRESH, TARGET_MPP, NORMALIZE, stain_ref))
 
-    manifest_path = Path(OUTPUT_ROOT) / MANIFEST_NAME
+    # 5. Manifest file is unique per batch
+    manifest_path = Path(OUTPUT_ROOT) / f"manifest_batch_{args.batch_index}.csv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, 'w', newline='') as mf:
         writer = csv.writer(mf)
         writer.writerow(['wsi_path', 'tile_path', 'tile_index'])
 
+    # 6. Run processing
     if WORKERS > 1 and len(tasks) > 0:
+        from multiprocessing import Pool
         with Pool(processes=WORKERS) as pool:
-            for res in tqdm(pool.imap_unordered(process_wsi_pyvips, tasks), total=len(tasks)):
+            for res in tqdm(pool.imap_unordered(process_wsi_no_pyvips, tasks), total=len(tasks)):
                 wsi, ok, payload = res
                 if ok:
                     with open(manifest_path, 'a', newline='') as mf:
@@ -304,8 +293,7 @@ def main():
                     print(f"WSI failed: {wsi} -> {payload}")
     else:
         for t in tqdm(tasks):
-            res = process_wsi_pyvips(t)
-            wsi, ok, payload = res
+            wsi, ok, payload = process_wsi_no_pyvips(t)
             if ok:
                 with open(manifest_path, 'a', newline='') as mf:
                     writer = csv.writer(mf)
@@ -314,7 +302,7 @@ def main():
             else:
                 print(f"WSI failed: {wsi} -> {payload}")
 
-    print('Done. Manifest at', manifest_path)
+    print("Done. Manifest at:", manifest_path)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
