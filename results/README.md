@@ -1,9 +1,6 @@
 LUAD = Lung Adenocarcinoma  
 LUSC = Lung Squamous Cell Carcinoma
 
-APM = Antigen Presentation Machinery score  
-TIS = T-cell Inflamed Signature score
-
 Each NPZ file contains model predictions and ground-truth gene expression
 values for a held-out test fold.
 
