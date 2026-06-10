@@ -23,7 +23,7 @@ pip install -r requirements.txt
 ## Pipeline
 
 Step 1:
-prepare_expression_data.py
+prepare_expression_data/
 
 Step 2:
 image_preprocessing.py
