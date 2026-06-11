@@ -1,0 +1,15 @@
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+seaborn
+umap-learn
+torch
+torchvision
+tqdm
+Pillow
+psutil
+scikit-image
+openslide-python
+staintools
