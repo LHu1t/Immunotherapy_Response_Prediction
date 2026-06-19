@@ -7,10 +7,10 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.manifold import TSNE
 import umap
 
-# === Step 1: Load data ===
+# Load data
 df = pd.read_csv("LUAD_LUSC_Data/Immunotherapy_Prediction/combined_clinical_expression_ALL2.csv")
 
-# === Step 2: Detect the cancer subtype ===
+# Detect the cancer subtype
 diagnosis_col = None
 for col in df.columns:
     if "primary_diagnosis" in col:
@@ -32,7 +32,7 @@ def classify_subtype(x):
 df["Cancer_Subtype"] = df[diagnosis_col].apply(classify_subtype)
 df = df[df["Cancer_Subtype"].notnull()]  # keep only valid subtypes
 
-# === Step 3: Select gene expression columns ===
+# Select gene expression columns
 expr_cols = [c for c in df.columns if c.endswith("_fpkm_uq")]
 if not expr_cols:
     raise ValueError("No *_fpkm_uq columns found in the CSV — please check column names.")
@@ -40,7 +40,7 @@ if not expr_cols:
 # Drop rows with missing expression values
 df_filtered = df.dropna(subset=expr_cols)
 
-# === Step 4: Prepare data ===
+# Prepare data
 X = np.log2(df_filtered[expr_cols] + 1) # Log-transform expression values
 
 y = df_filtered["Cancer_Subtype"].values
@@ -48,7 +48,7 @@ y = df_filtered["Cancer_Subtype"].values
 # Standardize features
 X_scaled = StandardScaler().fit_transform(X)
 
-# === Step 5: PCA (for baseline visualization) ===
+# PCA (for baseline visualisation)
 pca = PCA(n_components=2)
 pca_result = pca.fit_transform(X_scaled)
 df_filtered["PCA1"], df_filtered["PCA2"] = pca_result[:, 0], pca_result[:, 1]
@@ -67,7 +67,7 @@ print(top_pc1)
 print("\nTop 10 genes driving PC2:")
 print(top_pc2)
 
-# === Step 6: Linear Discriminant Analysis (supervised) ===
+# Linear Discriminant Analysis (supervised)
 lda = LDA(n_components=1)
 X_lda = lda.fit_transform(X_scaled, y)
 df_filtered["LDA1"] = X_lda[:, 0]
@@ -77,7 +77,7 @@ top_lda = lda_loadings.abs().sort_values(ascending=False).head(10)
 print("\nTop 10 genes driving LDA separation:")
 print(top_lda)
 
-# === Step 7: t-SNE (nonlinear) ===
+# t-SNE (nonlinear)
 tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
 X_tsne = tsne.fit_transform(X_scaled)
 df_filtered["tSNE1"], df_filtered["tSNE2"] = X_tsne[:, 0], X_tsne[:, 1]
@@ -87,7 +87,7 @@ tsne_corr = X.corrwith(df_filtered["tSNE1"]).abs().sort_values(ascending=False).
 print("\nTop 10 genes correlated with tSNE1:")
 print(tsne_corr)
 
-# === Step 8: UMAP (nonlinear, often clearer than t-SNE) ===
+# UMAP (nonlinear)
 reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
 X_umap = reducer.fit_transform(X_scaled)
 df_filtered["UMAP1"], df_filtered["UMAP2"] = X_umap[:, 0], X_umap[:, 1]
@@ -96,7 +96,7 @@ umap_corr = X.corrwith(df_filtered["UMAP1"]).abs().sort_values(ascending=False).
 print("\nTop 10 genes correlated with UMAP1:")
 print(umap_corr)
 
-# === Step 9: Visualization ===
+# Visualisation
 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 plots = [
     ("PCA1", "PCA2", "PCA (unsupervised)"),
