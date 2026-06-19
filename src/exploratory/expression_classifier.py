@@ -9,12 +9,10 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ----------------------------
-# 1. LOAD DATA
-# ----------------------------
+# Load data
 df = pd.read_csv("LUAD_LUSC_Data/Immunotherapy_Prediction/combined_clinical_expression_ALL2.csv")
 
-# === Step 2: Detect the cancer subtype ===
+# Detect the cancer subtype
 diagnosis_col = None
 for col in df.columns:
     if "primary_diagnosis" in col.lower():
@@ -38,9 +36,7 @@ df = df[df["Cancer_Subtype"].notnull()]  # keep only valid subtypes
 
 print(f"\nDetected {df['Cancer_Subtype'].value_counts().to_dict()}")
 
-# ----------------------------
-# 3. SELECT EXPRESSION FEATURES
-# ----------------------------
+# Select expression features
 expr_cols = [c for c in df.columns if c.endswith("_fpkm_uq")]
 if not expr_cols:
     raise ValueError("No gene expression columns ending with '_fpkm_uq' found!")
@@ -55,9 +51,7 @@ print(f"\nTotal patients: {n_total}")
 print(f"Patients used (non-missing expression): {n_filtered}")
 print(f"→ {n_filtered/n_total*100:.1f}% retained for analysis")
 
-# ----------------------------
-# 4. PREPROCESS FEATURES
-# ----------------------------
+# Preprocessing features
 X = np.log2(df_filtered[expr_cols] + 1)  # log2 transform
 y = df_filtered["Cancer_Subtype"]
 
@@ -67,9 +61,7 @@ y_encoded = le.fit_transform(y)
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# ----------------------------
-# 5. TRAIN/VALIDATION SPLIT
-# ----------------------------
+# Train/validation splitting
 X_train, X_val, y_train, y_val = train_test_split(
     X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
 )
@@ -77,9 +69,7 @@ X_train, X_val, y_train, y_val = train_test_split(
 print(f"\nTraining samples: {len(X_train)}")
 print(f"Validation samples: {len(X_val)}")
 
-# ----------------------------
-# 6. RANDOM FOREST CLASSIFIER
-# ----------------------------
+# Random forest classifier
 rf = RandomForestClassifier(
     n_estimators=300,
     random_state=42,
@@ -89,9 +79,7 @@ rf = RandomForestClassifier(
 
 rf.fit(X_train, y_train)
 
-# ----------------------------
-# 7. EVALUATION
-# ----------------------------
+# Evaluation
 y_pred = rf.predict(X_val)
 y_proba = rf.predict_proba(X_val)[:, 1]
 
@@ -123,9 +111,7 @@ plt.title("ROC Curve for Cancer Subtype Prediction")
 plt.legend()
 plt.show()
 
-# ----------------------------
-# 8. FEATURE IMPORTANCE
-# ----------------------------
+# Feature importance
 importances = pd.Series(rf.feature_importances_, index=expr_cols)
 top_genes = importances.sort_values(ascending=False).head(10)
 print("\nTop 10 most predictive genes:")
@@ -137,9 +123,7 @@ plt.title("Top 10 Genes Driving Subtype Prediction")
 plt.xlabel("Feature Importance (Random Forest)")
 plt.show()
 
-# ----------------------------
-# 9. SAVE PREDICTIONS
-# ----------------------------
+# Save predictions
 df_results = df_filtered.copy()
 probs = rf.predict_proba(X_scaled)
 df_results["Predicted_Subtype"] = le.inverse_transform(rf.predict(X_scaled))
