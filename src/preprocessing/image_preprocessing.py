@@ -27,9 +27,7 @@ try:
 except:
     STAINTOOLS_AVAILABLE = False
 
-# -----------------------------
-# CONFIG (unchanged)
-# -----------------------------
+# Configuration
 INPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy" # "/home/zcemlhu/Scratch"
 CANCER = "LUAD" # "LUSC"
 OUTPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Test_Tiles2" # "/home/zcemlhu/Scratch/LUSC_Tiles"
@@ -48,9 +46,8 @@ THUMB_MAX_DIM = 512
 SAVE_FORMAT = 'png'
 PNG_COMPRESSION = 6
 WEBP_QUALITY = 80
-# -----------------------------
 
-# ---- Global stain reference shared by workers ----
+# Global stain reference shared by workers
 GLOBAL_STAIN_REF = None
 
 def init_worker(stain_ref):
@@ -169,7 +166,7 @@ def process_wsi_no_pyvips(args):
         mask = otsu_mask(img_rescaled, max_dim=THUMB_MAX_DIM)
         H, W = img_rescaled.shape[:2]
 
-        # tile coords
+        # Tile coords
         coords = []
         for y in range(0, H, tile_size):
             for x in range(0, W, tile_size):
@@ -181,7 +178,7 @@ def process_wsi_no_pyvips(args):
 
         print(f"[INFO] {wsi_id}: {len(coords)} tissue tiles found.")
 
-        # sample/pad
+        # Sample/pad
         if len(coords) >= tiles_per_wsi:
             selected = random.sample(coords, tiles_per_wsi)
         else:
@@ -189,7 +186,7 @@ def process_wsi_no_pyvips(args):
             selected = coords + [None] * need
             print(f"[INFO] {wsi_id}: padded {need} tiles.")
 
-        # stain normalizer (created once per WSI)
+        # Stain normalizer (created once per WSI)
         normalizer = None
         if normalize and STAINTOOLS_AVAILABLE and GLOBAL_STAIN_REF is not None:
             try:
@@ -200,7 +197,7 @@ def process_wsi_no_pyvips(args):
 
         rows = []
 
-        # save tiles
+        # Save tiles
         for i, coord in enumerate(selected):
             if coord is None:
                 tile = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
@@ -213,7 +210,7 @@ def process_wsi_no_pyvips(args):
                     pad.paste(tile, (0, 0))
                     tile = pad
 
-            # stain normalization
+            # Stain normalization
             if normalize and normalizer is not None:
                 try:
                     arr = normalizer.transform(np.array(tile))
@@ -250,7 +247,7 @@ def main():
     svs_files = list(iter_svs_files(INPUT_ROOT, CANCER))
     print(f"Found {len(svs_files)} SVS files under {INPUT_ROOT}/{CANCER}")
 
-    # 2. Compute batch using slicing (avoids materializing all batches)
+    # 2. Compute batch using slicing
     start = args.batch_index * args.batch_size
     end = start + args.batch_size
     batch = svs_files[start:end]
