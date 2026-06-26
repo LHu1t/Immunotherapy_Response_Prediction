@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
+"""
+WSI preprocessing pipeline (NO full-resolution WSI loads).
 
-import math
+Key properties:
+- Never loads the entire WSI into RAM
+- Uses OpenSlide pyramids correctly
+- Otsu tissue mask computed from thumbnail only
+- Tiles read one-at-a-time from OpenSlide
+- Optional stain normalisation
+- Supports batching (--batch-index / --batch-size)
+"""
+
 import os
-import random
+import math
 import csv
+import random
+import argparse
 import traceback
 from pathlib import Path
 from multiprocessing import Pool
-import argparse
 
 import numpy as np
 from PIL import Image
@@ -15,7 +26,7 @@ from tqdm import tqdm
 
 try:
     import openslide
-except:
+except Exception:
     openslide = None
 
 from skimage.filters import threshold_otsu
@@ -24,13 +35,13 @@ from skimage.color import rgb2gray
 try:
     import staintools
     STAINTOOLS_AVAILABLE = True
-except:
+except Exception:
     STAINTOOLS_AVAILABLE = False
 
-# Configuration
-INPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy" # "/home/zcemlhu/Scratch"
-CANCER = "LUAD" # "LUSC"
-OUTPUT_ROOT = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Test_Tiles2" # "/home/zcemlhu/Scratch/LUSC_Tiles"
+# ================= CONFIG =================
+INPUT_ROOT = "/home/zcemlhu/Scratch"
+CANCER = "LUAD"
+OUTPUT_ROOT = "/home/zcemlhu/Scratch/LUAD_Tiles"
 
 TILE_SIZE = 512
 TILES_PER_WSI = 5000
@@ -39,74 +50,41 @@ TARGET_MPP = 0.5
 WORKERS = 4
 
 NORMALIZE = True
-STAIN_REF_PATH = r"/Volumes/SeagateBas/Immunotherapy/LUAD_Test/8f7cdbca-32a7-4bd3-be11-6cf7b7b03d13/TCGA-50-6591-01Z-00-DX1.12e1050b-75e9-4059-b945-291995b3e93c.svs"# "/home/zcemlhu/Scratch/LUSC/0a780b0b-fce9-4999-92ba-a8b277578a1d/TCGA-60-2724-01Z-00-DX1.98f9e48f-9c09-4969-aa34-05666616ee9a.svs"
+STAIN_REF_PATH = "/home/zcemlhu/Scratch/LUAD/1ddc6a98-e855-4ca9-8809-f20725fe3120/TCGA-55-6983-01Z-00-DX1.8f940a64-1f1b-4e6e-99ea-418175be2b3f.svs"
 
-MANIFEST_NAME = 'manifest.csv'
 THUMB_MAX_DIM = 512
-SAVE_FORMAT = 'png'
+SAVE_FORMAT = "png"
 PNG_COMPRESSION = 6
-WEBP_QUALITY = 80
+# ==========================================
 
-# Global stain reference shared by workers
-GLOBAL_STAIN_REF = None
-
-def init_worker(stain_ref):
-    """
-    Runs once per worker process.
-    Store the stain reference image globally so it is not pickled per task.
-    """
-    global GLOBAL_STAIN_REF
-    GLOBAL_STAIN_REF = stain_ref
 
 def get_mpp(slide):
-    keys = ['openslide.mpp-x', 'aperio.MPP', 'openslide.mpp-y']
+    keys = ["openslide.mpp-x", "aperio.MPP", "openslide.mpp-y"]
     for k in keys:
         if k in slide.properties:
             try:
                 return float(slide.properties[k])
-            except:
+            except Exception:
                 pass
     return None
 
 
-def iter_svs_files(root_dir, cancer):
-    root = Path(root_dir) / cancer
-    for patient in root.iterdir():
-        if not patient.is_dir():
-            continue
-        for svs in patient.glob("*.svs"):
-            yield svs
+def iter_svs_files(root, cancer):
+    base = Path(root) / cancer
+    for patient in base.iterdir():
+        if patient.is_dir():
+            yield from patient.glob("*.svs")
 
 
-def otsu_mask(arr, max_dim=THUMB_MAX_DIM):
-    """Compute fast Otsu mask on a downscaled thumbnail."""
-    h, w = arr.shape[:2]
-    scale = max_dim / max(h, w)
+def otsu_mask_from_thumbnail(slide):
+    thumb = slide.get_thumbnail((THUMB_MAX_DIM, THUMB_MAX_DIM))
+    arr = np.array(thumb.convert("RGB"))
+    gray = rgb2gray(arr)
+    t = threshold_otsu((gray * 255).astype(np.uint8)) / 255.0
+    return gray < t, arr.shape[1], arr.shape[0]
 
-    if scale < 1:
-        thumb = Image.fromarray(arr).resize(
-            (int(w * scale), int(h * scale)),
-            resample=Image.BILINEAR
-        )
-        small = np.array(thumb)
-    else:
-        small = arr
 
-    gray = rgb2gray(small)
-    thresh = threshold_otsu((gray * 255).astype(np.uint8)) / 255.0
-    mask_small = gray < thresh
-
-    # upscale mask back
-    mask = np.array(
-        Image.fromarray((mask_small * 255).astype(np.uint8)).resize(
-            (w, h),
-            resample=Image.NEAREST
-        )
-    ) > 0
-
-    return mask
-
-def process_wsi_no_pyvips(args):
+def process_wsi(args):
     (
         wsi_path,
         output_root,
@@ -115,9 +93,8 @@ def process_wsi_no_pyvips(args):
         occupancy_thresh,
         target_mpp,
         normalize,
+        stain_ref
     ) = args
-
-    global GLOBAL_STAIN_REF
 
     wsi_path = Path(wsi_path)
     wsi_id = wsi_path.stem
@@ -129,113 +106,94 @@ def process_wsi_no_pyvips(args):
         slide_mpp = get_mpp(slide)
 
         if slide_mpp is None:
-            print(f"[WARN] {wsi_id}: No MPP → no rescale.")
             scale = 1.0
         else:
             scale = slide_mpp / target_mpp
 
-        # choose appropriate level for reading whole slide
-        if scale >= 1:
-            best = slide.get_best_level_for_downsample(scale)
-            down = slide.level_downsamples[best]
-            w, h = slide.level_dimensions[best]
-            region = slide.read_region((0, 0), best, (w, h)).convert("RGB")
-            img = np.array(region)
-            final_w = int(img.shape[1] * (down / scale))
-            final_h = int(img.shape[0] * (down / scale))
-            img_rescaled = np.array(
-                Image.fromarray(img).resize(
-                    (final_w, final_h),
-                    resample=Image.BILINEAR
-                )
-            )
-        else:
-            w, h = slide.dimensions
-            region = slide.read_region((0, 0), 0, (w, h)).convert("RGB")
-            img = np.array(region)
-            final_w = int(w / scale)
-            final_h = int(h / scale)
-            img_rescaled = np.array(
-                Image.fromarray(img).resize(
-                    (final_w, final_h),
-                    resample=Image.BILINEAR
-                )
-            )
+        best_level = slide.get_best_level_for_downsample(scale)
+        level_down = slide.level_downsamples[best_level]
+        level_w, level_h = slide.level_dimensions[best_level]
 
-        # Otsu tissue mask
-        mask = otsu_mask(img_rescaled, max_dim=THUMB_MAX_DIM)
-        H, W = img_rescaled.shape[:2]
+        # thumbnail mask
+        mask_thumb, tw, th = otsu_mask_from_thumbnail(slide)
 
-        # Tile coords
+        # map thumb -> level coords
+        sx = level_w / tw
+        sy = level_h / th
+
         coords = []
-        for y in range(0, H, tile_size):
-            for x in range(0, W, tile_size):
-                sub = mask[y:y+tile_size, x:x+tile_size]
-                if sub.size == 0:
+        for y in range(0, level_h, tile_size):
+            for x in range(0, level_w, tile_size):
+                tx0 = int(x / sx)
+                ty0 = int(y / sy)
+                tx1 = int(min((x + tile_size) / sx, tw))
+                ty1 = int(min((y + tile_size) / sy, th))
+                if tx1 <= tx0 or ty1 <= ty0:
                     continue
-                if sub.mean() >= occupancy_thresh:
+                occ = mask_thumb[ty0:ty1, tx0:tx1].mean()
+                if occ >= occupancy_thresh:
                     coords.append((x, y))
 
-        print(f"[INFO] {wsi_id}: {len(coords)} tissue tiles found.")
-
-        # Sample/pad
         if len(coords) >= tiles_per_wsi:
-            selected = random.sample(coords, tiles_per_wsi)
+            coords = sorted(coords, key=lambda p: (p[1], p[0]))  # y, x
+            selected = coords[:tiles_per_wsi]
         else:
-            need = tiles_per_wsi - len(coords)
-            selected = coords + [None] * need
-            print(f"[INFO] {wsi_id}: padded {need} tiles.")
+            selected = coords + [None] * (tiles_per_wsi - len(coords))
 
-        # Stain normalizer (created once per WSI)
         normalizer = None
-        if normalize and STAINTOOLS_AVAILABLE and GLOBAL_STAIN_REF is not None:
+        if normalize and STAINTOOLS_AVAILABLE and stain_ref is not None:
             try:
                 normalizer = staintools.StainNormalizer(method="vahadane")
-                normalizer.fit(GLOBAL_STAIN_REF)
-            except:
+                normalizer.fit(stain_ref)
+            except Exception:
                 normalizer = None
 
         rows = []
-
-        # Save tiles
         for i, coord in enumerate(selected):
             if coord is None:
                 tile = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
             else:
-                x, y = coord
-                tile_arr = img_rescaled[y:y+tile_size, x:x+tile_size]
-                tile = Image.fromarray(tile_arr)
-                if tile.size != (tile_size, tile_size):
-                    pad = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
-                    pad.paste(tile, (0, 0))
-                    tile = pad
+                lx, ly = coord
+                x0 = int(lx * level_down)
+                y0 = int(ly * level_down)
 
-            # Stain normalization
+                # Create white canvas
+                tile = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
+
+                # Compute how much is actually inside the slide
+                max_w, max_h = slide.level_dimensions[best_level]
+                read_w = min(tile_size, max_w - lx)
+                read_h = min(tile_size, max_h - ly)
+
+                if read_w > 0 and read_h > 0:
+                    region = slide.read_region(
+                    (x0, y0),
+                    best_level,
+                    (int(read_w), int(read_h))
+                    ).convert("RGB")
+
+                    tile.paste(region, (0, 0))
+            
             if normalize and normalizer is not None:
                 try:
-                    arr = normalizer.transform(np.array(tile))
-                    tile = Image.fromarray(arr)
-                except:
+                    tile = Image.fromarray(normalizer.transform(np.array(tile)))
+                except Exception:
                     pass
 
             fname = out_dir / f"{wsi_id}_tile_{i:05d}.{SAVE_FORMAT}"
-
-            if SAVE_FORMAT == "png":
-                tile.save(fname, compress_level=PNG_COMPRESSION)
-            else:
-                tile.save(fname, quality=WEBP_QUALITY, format="WEBP")
-
+            tile.save(fname, compress_level=PNG_COMPRESSION)
             rows.append((str(wsi_path), str(fname), i))
 
-        return (str(wsi_path), True, rows)
+        return str(wsi_path), True, rows
 
     except Exception:
-        return (str(wsi_path), False, traceback.format_exc())
-    
-def chunk_list(lst, chunk_size):
-    """Yield successive chunk_size-sized chunks."""
-    for i in range(0, len(lst), chunk_size):
-        yield lst[i:i + chunk_size]
+        return str(wsi_path), False, traceback.format_exc()
+
+
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -243,81 +201,45 @@ def main():
     parser.add_argument("--batch-size", type=int, default=50)
     args = parser.parse_args()
 
-    # 1. Get all slides
-    svs_files = list(iter_svs_files(INPUT_ROOT, CANCER))
-    print(f"Found {len(svs_files)} SVS files under {INPUT_ROOT}/{CANCER}")
+    slides = list(iter_svs_files(INPUT_ROOT, CANCER))
+    batches = list(chunk_list(slides, args.batch_size))
 
-    # 2. Compute batch using slicing
-    start = args.batch_index * args.batch_size
-    end = start + args.batch_size
-    batch = svs_files[start:end]
-
-    if not batch:
-        print(f"Batch {args.batch_index} is empty.")
+    if args.batch_index >= len(batches):
+        print("Batch index out of range")
         return
 
-    print(f"Processing batch {args.batch_index} "
-          f"({len(batch)} slides)")
+    batch = batches[args.batch_index]
+    print(f"Processing batch {args.batch_index}/{len(batches)-1} ({len(batch)} slides)")
 
-    # 3. Prepare stain reference once
     stain_ref = None
-    if NORMALIZE and STAINTOOLS_AVAILABLE and STAIN_REF_PATH is not None:
+    if NORMALIZE and STAINTOOLS_AVAILABLE and STAIN_REF_PATH:
         try:
             stain_ref = np.array(Image.open(STAIN_REF_PATH).convert("RGB"))
         except Exception:
-            stain_ref = None
+            pass
 
-    # 4. Build tasks for the batch (smallest possible payload)
-    tasks = []
-    for svs in batch:
-        tasks.append((
-            str(svs),
-            OUTPUT_ROOT,
-            TILES_PER_WSI,
-            TILE_SIZE,
-            OCCUPANCY_THRESH,
-            TARGET_MPP,
-            NORMALIZE,
-        ))
+    tasks = [
+        (str(s), OUTPUT_ROOT, TILES_PER_WSI, TILE_SIZE, OCCUPANCY_THRESH,
+         TARGET_MPP, NORMALIZE, stain_ref)
+        for s in batch
+    ]
 
-    # 5. Prepare manifest
-    manifest_path = Path(OUTPUT_ROOT) / f"manifest_batch_{args.batch_index}.csv"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = Path(OUTPUT_ROOT) / f"manifest_batch_{args.batch_index}.csv"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(manifest_path, 'w', newline='') as mf:
-        csv.writer(mf).writerow(['wsi_path', 'tile_path', 'tile_index'])
+    with open(manifest, "w", newline="") as f:
+        csv.writer(f).writerow(["wsi", "tile", "index"])
 
-    # 6. multiprocessing (with global stain reference)
-    if WORKERS > 1 and len(tasks) > 0:
-        from multiprocessing import Pool
-        with Pool(
-            processes=WORKERS,
-            initializer=init_worker,
-            initargs=(stain_ref,)
-        ) as pool:
-            for res in tqdm(pool.imap_unordered(process_wsi_no_pyvips, tasks),
-                            total=len(tasks)):
-                wsi, ok, payload = res
-                if ok:
-                    with open(manifest_path, 'a', newline='') as mf:
-                        writer = csv.writer(mf)
-                        for row in payload:
-                            writer.writerow(row)
-                else:
-                    print(f"WSI failed: {wsi} -> {payload}")
-    else:
-        # single-thread fallback
-        with open(manifest_path, 'a', newline='') as mf:
-            writer = csv.writer(mf)
-            for t in tqdm(tasks):
-                wsi, ok, payload = process_wsi_no_pyvips(t)
-                if ok:
-                    for row in payload:
-                        writer.writerow(row)
-                else:
-                    print(f"WSI failed: {wsi} -> {payload}")
+    with Pool(WORKERS) as pool:
+        for wsi, ok, payload in tqdm(pool.imap_unordered(process_wsi, tasks), total=len(tasks)):
+            if ok:
+                with open(manifest, "a", newline="") as f:
+                    csv.writer(f).writerows(payload)
+            else:
+                print(f"FAILED {wsi}\n{payload}")
 
-    print("Done. Manifest at:", manifest_path)
+    print("Done", manifest)
+
 
 if __name__ == "__main__":
     main()
